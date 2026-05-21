@@ -2,6 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as webllm from "@mlc-ai/web-llm";
+import { addDocument, searchDocuments } from "../lib/rag";
+import { getSlidingWindow, summarizeOldMessages, MAX_CONTEXT_TOKENS } from "../lib/budget";
+
+export type Message = { role: "user" | "assistant" | "system"; content: string };
 
 const MODELS = [
   {
@@ -14,8 +18,6 @@ const MODELS = [
   },
 ];
 
-type Message = { role: "user" | "assistant"; content: string };
-
 export default function WebLLMChat() {
   const engineRef = useRef<any>(null);
   const [model, setModel] = useState(MODELS[0].value);
@@ -23,6 +25,7 @@ export default function WebLLMChat() {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<string>("Idle");
+  const [conversationSummary, setConversationSummary] = useState("");
 
   async function initModel(selectedModel: string) {
     setLoading(true);
@@ -49,35 +52,86 @@ export default function WebLLMChat() {
     initModel(model);
   }, []);
 
+  async function handleAddKnowledge() {
+    const text = window.prompt("Paste knowledge text to embed:");
+    if (!text) return;
+    
+    setStatus("Adding knowledge to vector DB...");
+    try {
+      await addDocument(text);
+      setStatus("Knowledge added! Model ready");
+    } catch (err) {
+      console.error(err);
+      setStatus("Failed to add knowledge");
+    }
+  }
+
   async function sendMessage() {
     if (!engineRef.current || !prompt.trim()) return;
 
-    const userMessage: Message = { role: "user", content: prompt };
-    const updatedMessages = [...messages, userMessage];
-    setMessages(updatedMessages);
+    const userText = prompt;
     setPrompt("");
 
-    setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+    // Retrieval (RAG)
+    setStatus("Searching knowledge base...");
+    const retrievedDocs = await searchDocuments(userText, 3);
+    const contextStr = retrievedDocs.map(d => d.text).join("\n\n");
+    
+    // Token Budgeting = MAX_CONTEXT_TOKENS - RAG - system - summary
+    const historyBudget = MAX_CONTEXT_TOKENS - 1000 - 200 - 500;
+    const windowMessages = getSlidingWindow(messages, historyBudget);
+    
+    // Check if we have "overflow" messages to summarise
+    const overflowMessages = messages.slice(0, messages.length - windowMessages.length);
+    if (overflowMessages.length > 0) {
+      summarizeOldMessages(engineRef.current, overflowMessages, conversationSummary)
+        .then(newSummary => setConversationSummary(newSummary))
+        .catch(console.error);
+    }
 
-    const stream = await engineRef.current.chat.completions.create({
-      messages: updatedMessages.slice(-6),
-      stream: true,
-    });
+    const displayMessage: Message = { role: "user", content: userText };
+    setMessages([...messages, displayMessage, { role: "assistant", content: "" }]);
 
-    let assistantText = "";
+    const augmentedUserMessage: Message = {
+      role: "user",
+      content: `Use the provided context to answer the question. \n\nContext:\n${contextStr}\n\nQuestion: ${userText}`
+    };
 
-    for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content || "";
-      assistantText += delta;
+    const systemMessage: Message = {
+      role: "system",
+      content: `You are a helpful AI. \nPrevious conversation summary: ${conversationSummary}`
+    };
 
-      setMessages((prev) => {
-        const copy = [...prev];
-        copy[copy.length - 1] = {
-          role: "assistant",
-          content: assistantText,
-        };
-        return copy;
+    const payloadMessages = [
+      systemMessage,
+      ...windowMessages,
+      augmentedUserMessage
+    ];
+
+    // generate response
+    setStatus("Generating response...");
+    try {
+      const stream = await engineRef.current.chat.completions.create({
+        messages: payloadMessages,
+        stream: true,
       });
+
+      let assistantText = "";
+      for await (const chunk of stream) {
+        assistantText += chunk.choices?.[0]?.delta?.content || "";
+        setMessages((prev) => {
+          const copy = [...prev];
+          copy[copy.length - 1] = {
+            role: "assistant",
+            content: assistantText,
+          };
+          return copy;
+        });
+      }
+      setStatus("Model ready");
+    } catch (err) {
+      console.error(err);
+      setStatus("Error generating response");
     }
   }
 
@@ -86,11 +140,17 @@ export default function WebLLMChat() {
       {/* Header */}
       <div className="p-4 border-b border-gray-800 flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold">WebLLM Starter</h1>
+          <h1 className="text-xl font-semibold">WebLLM Starter (RAG)</h1>
           <p className="text-xs text-gray-400">Runs fully in browser (WebGPU)</p>
         </div>
 
         <div className="flex gap-2 items-center">
+          <button 
+             onClick={handleAddKnowledge}
+             className="bg-green-700 hover:bg-green-600 px-3 py-1 mr-2 rounded text-sm transition-colors">
+             + Add Knowledge
+          </button>
+          
           <select
             className="bg-gray-900 border border-gray-700 px-2 py-1 rounded"
             value={model}
@@ -109,8 +169,9 @@ export default function WebLLMChat() {
       </div>
 
       {/* Status */}
-      <div className="px-4 py-2 text-xs text-gray-400 border-b border-gray-800">
-        {status}
+      <div className="px-4 py-2 text-xs text-gray-400 border-b border-gray-800 flex justify-between">
+        <span>{status}</span>
+        {conversationSummary && <span className="text-blue-400">Memory Active</span>}
       </div>
 
       {/* Chat */}
@@ -132,7 +193,7 @@ export default function WebLLMChat() {
       {/* Input */}
       <div className="p-4 border-t border-gray-800 flex gap-2">
         <input
-          className="flex-1 bg-gray-900 border border-gray-700 px-3 py-2 rounded"
+          className="flex-1 bg-gray-900 border border-gray-700 px-3 py-2 rounded focus:outline-none focus:border-blue-500"
           value={prompt}
           placeholder="Ask something..."
           onChange={(e) => setPrompt(e.target.value)}
@@ -141,7 +202,7 @@ export default function WebLLMChat() {
         <button
           onClick={sendMessage}
           disabled={loading}
-          className="bg-blue-600 px-4 py-2 rounded disabled:opacity-50"
+          className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded disabled:opacity-50 transition-colors"
         >
           Send
         </button>
