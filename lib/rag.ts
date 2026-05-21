@@ -1,7 +1,14 @@
-import { pipeline, FeatureExtractionPipeline } from "@huggingface/transformers";
-import { openDB, IDBPDatabase } from "idb";
+import {
+  env,
+  type FeatureExtractionPipeline,
+  pipeline,
+} from "@huggingface/transformers";
+import type { MLCEngineInterface } from "@mlc-ai/web-llm";
+import { type IDBPDatabase, openDB } from "idb";
 import MiniSearch from "minisearch";
 import { cosineSimilarity } from "../utils";
+
+env.allowLocalModels = false;
 
 // embeddings
 let embedder: FeatureExtractionPipeline | null = null;
@@ -22,7 +29,11 @@ export async function getEmbedding(text: string): Promise<number[]> {
 }
 
 // lightweight semantic chunking to preserve context
-export function chunkText(text: string, maxTokens: number = 200, overlap: number = 50): string[] {
+export function chunkText(
+  text: string,
+  maxTokens: number = 200,
+  overlap: number = 50,
+): string[] {
   const sentences = text.match(/[^.!?]+[.!?]+|\s*\n\s*/g) || [text];
   const chunks: string[] = [];
   let currentChunk = "";
@@ -35,7 +46,7 @@ export function chunkText(text: string, maxTokens: number = 200, overlap: number
       currentChunk = currentChunk.slice(-Math.floor(overlap * 4)) + sentence;
       currentTokens = Math.ceil(currentChunk.length / 4);
     } else {
-      currentChunk += " " + sentence;
+      currentChunk += ` ${sentence}`;
       currentTokens += sentenceTokens;
     }
   }
@@ -52,9 +63,9 @@ interface RAGChunk {
   timestamp: number;
 }
 
-let miniSearch = new MiniSearch<RAGChunk>({
-  fields: ['text'],
-  storeFields: ['id', 'text', 'parentId']
+const miniSearch = new MiniSearch<RAGChunk>({
+  fields: ["text"],
+  storeFields: ["id", "text", "parentId"],
 });
 
 export async function initDB(): Promise<IDBPDatabase> {
@@ -84,7 +95,7 @@ export async function addDocument(text: string) {
   for (let i = 0; i < chunks.length; i++) {
     const chunkTextStr = chunks[i];
     const embedding = await getEmbedding(chunkTextStr);
-    
+
     const docChunk: RAGChunk = {
       id: `${parentId}-chunk-${i}`,
       parentId,
@@ -92,9 +103,9 @@ export async function addDocument(text: string) {
       embedding,
       timestamp: Date.now(),
     };
-    
+
     await db.put("chunks", docChunk);
-    
+
     // Add to keyword index
     if (!miniSearch.has(docChunk.id)) {
       miniSearch.add(docChunk);
@@ -103,32 +114,41 @@ export async function addDocument(text: string) {
 }
 
 // HyDE: generate a hypothetical answer to improve embedding matching
-export async function generateHyDE(engine: any, query: string): Promise<string> {
+export async function generateHyDE(
+  engine: MLCEngineInterface,
+  query: string,
+): Promise<string | null> {
   const prompt = `Please write a short, informative hypothetical paragraph that directly answers the following question. Do not include introductory filler. \n\nQuestion: ${query}`;
-  
+
   const response = await engine.chat.completions.create({
     messages: [{ role: "user", content: prompt }],
     temperature: 0.3,
-    max_tokens: 150
+    max_tokens: 150,
   });
-  
+
   return response.choices[0].message.content;
 }
 
 // hybrid search: RRF of vector + keyword
-export async function searchDocumentsHybrid(query: string, searchEmbedding: number[], topK: number = 3) {
+export async function searchDocumentsHybrid(
+  query: string,
+  searchEmbedding: number[],
+  topK: number = 3,
+) {
   const db = await initDB();
   const allChunks: RAGChunk[] = await db.getAll("chunks");
 
-  const vectorScores = allChunks.map(chunk => ({
-    ...chunk,
-    score: cosineSimilarity(searchEmbedding, chunk.embedding),
-  })).sort((a, b) => b.score - a.score);
+  const vectorScores = allChunks
+    .map((chunk) => ({
+      ...chunk,
+      score: cosineSimilarity(searchEmbedding, chunk.embedding),
+    }))
+    .sort((a, b) => b.score - a.score);
 
   const keywordResults = miniSearch.search(query, { fuzzy: 0.2 });
-  
-  const fusionScores: Record<string, { chunk: RAGChunk, score: number }> = {};
-  
+
+  const fusionScores: Record<string, { chunk: RAGChunk; score: number }> = {};
+
   const k = 60; // Standard RRF constant (https://www.ai21.com/glossary/tech/what-is-reciprocal-rank-fusion-rrf/)
 
   vectorScores.forEach((item, index) => {
@@ -137,7 +157,7 @@ export async function searchDocumentsHybrid(query: string, searchEmbedding: numb
 
   keywordResults.forEach((item, index) => {
     if (!fusionScores[item.id]) {
-      const chunk = allChunks.find(c => c.id === item.id);
+      const chunk = allChunks.find((c) => c.id === item.id);
       if (chunk) fusionScores[item.id] = { chunk, score: 0 };
     }
     fusionScores[item.id].score += 1 / (k + index + 1);
@@ -145,7 +165,7 @@ export async function searchDocumentsHybrid(query: string, searchEmbedding: numb
 
   const finalResults = Object.values(fusionScores)
     .sort((a, b) => b.score - a.score)
-    .map(res => res.chunk)
+    .map((res) => res.chunk)
     .slice(0, topK);
 
   return finalResults;

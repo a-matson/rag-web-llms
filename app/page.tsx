@@ -1,12 +1,24 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
 import * as webllm from "@mlc-ai/web-llm";
-import { addDocument, generateHyDE, getEmbedding, searchDocumentsHybrid } from "../lib/rag";
-import { getSlidingWindow, summarizeOldMessages, MAX_CONTEXT_TOKENS } from "../lib/budget";
-import { archiveToEpisodicMemory, extractAndStoreFacts, retrieveRelevantMemory } from "../lib/memory";
+import { useEffect, useRef, useState } from "react";
+import { getSlidingWindow, MAX_CONTEXT_TOKENS } from "../lib/budget";
+import {
+  archiveToEpisodicMemory,
+  extractAndStoreFacts,
+  retrieveRelevantMemory,
+} from "../lib/memory";
+import {
+  addDocument,
+  generateHyDE,
+  getEmbedding,
+  searchDocumentsHybrid,
+} from "../lib/rag";
 
-export type Message = { role: "user" | "assistant" | "system"; content: string };
+export type Message = {
+  role: "user" | "assistant" | "system";
+  content: string;
+};
 
 const MODELS = [
   {
@@ -20,13 +32,12 @@ const MODELS = [
 ];
 
 export default function WebLLMChat() {
-  const engineRef = useRef<any>(null);
+  const engineRef = useRef<webllm.MLCEngineInterface | null>(null);
   const [model, setModel] = useState(MODELS[0].value);
   const [loading, setLoading] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<string>("Idle");
-  const [conversationSummary, setConversationSummary] = useState("");
 
   async function initModel(selectedModel: string) {
     setLoading(true);
@@ -34,7 +45,7 @@ export default function WebLLMChat() {
 
     try {
       const engine = await webllm.CreateMLCEngine(selectedModel, {
-        initProgressCallback: (p: any) => {
+        initProgressCallback: (p: webllm.InitProgressReport) => {
           setStatus(`${p.text || "Loading..."}`);
         },
       });
@@ -49,6 +60,7 @@ export default function WebLLMChat() {
     }
   }
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: not needed
   useEffect(() => {
     initModel(model);
   }, []);
@@ -56,7 +68,7 @@ export default function WebLLMChat() {
   async function handleAddKnowledge() {
     const text = window.prompt("Paste knowledge text to embed:");
     if (!text) return;
-    
+
     setStatus("Adding knowledge to vector DB...");
     try {
       await addDocument(text);
@@ -77,32 +89,46 @@ export default function WebLLMChat() {
     const newMessages = [...messages, displayMessage];
     setMessages([...newMessages, { role: "assistant", content: "" }]);
 
-    extractAndStoreFacts(engineRef.current, userText);
+    await extractAndStoreFacts(engineRef.current, userText);
 
     // HyDE query transformation
     setStatus("Thinking about the query (HyDE)...");
     let searchEmbedding: number[];
     try {
-      const hypotheticalAnswer = await generateHyDE(engineRef.current, userText);
+      const hypotheticalAnswer = await generateHyDE(
+        engineRef.current,
+        userText,
+      );
+      if (!hypotheticalAnswer) throw new Error("Failed to generate response");
       searchEmbedding = await getEmbedding(hypotheticalAnswer);
     } catch (e) {
       console.warn("HyDE failed, falling back to raw query embedding", e);
-      searchEmbedding = await getEmbedding(userText);
+      try {
+        searchEmbedding = await getEmbedding(userText);
+      } catch (innerError) {
+        console.error("Embedding completely failed", innerError);
+        setStatus("Error: Model embedding failed.");
+        setLoading(false);
+        return;
+      }
     }
 
-   // hybrid retrieval across RAG + episodic + semantic
+    // hybrid retrieval across RAG + episodic + semantic
     setStatus("Searching knowledge base (Hybrid Search) and Memories...");
     const [retrievedDocs, relevantMemories] = await Promise.all([
-      searchDocumentsHybrid(userText, searchEmbedding, 3), 
-      retrieveRelevantMemory(searchEmbedding, 3)           
+      searchDocumentsHybrid(userText, searchEmbedding, 3),
+      retrieveRelevantMemory(searchEmbedding, 3),
     ]);
-    
+
     // token budgeting
-    const historyBudget = MAX_CONTEXT_TOKENS - 1500; 
+    const historyBudget = MAX_CONTEXT_TOKENS - 1500;
     const windowMessages = getSlidingWindow(newMessages, historyBudget);
 
     // archive overflowing messages to episodic memory
-    const overflowMessages = newMessages.slice(0, newMessages.length - windowMessages.length);
+    const overflowMessages = newMessages.slice(
+      0,
+      newMessages.length - windowMessages.length,
+    );
     if (overflowMessages.length > 0) {
       await archiveToEpisodicMemory(overflowMessages);
     }
@@ -110,10 +136,10 @@ export default function WebLLMChat() {
     // build the contextualised prompt
     const memoryContext = `
     [Known Facts about User]:
-    ${relevantMemories.semantic.length ? relevantMemories.semantic.map(f => `- ${f.text}`).join("\n") : "None relevant."}
+    ${relevantMemories.semantic.length ? relevantMemories.semantic.map((f) => `- ${f.text}`).join("\n") : "None relevant."}
 
     [Past Conversation Context]:
-    ${relevantMemories.episodic.length ? relevantMemories.episodic.map(e => `...\n${e.text}\n...`).join("\n") : "None relevant."}
+    ${relevantMemories.episodic.length ? relevantMemories.episodic.map((e) => `...\n${e.text}\n...`).join("\n") : "None relevant."}
 
     [Knowledge Base / RAG]:
     ${retrievedDocs.length ? retrievedDocs.map((d, i) => `Chunk ${i + 1}:\n${d.text}`).join("\n\n") : "None relevant."}
@@ -121,18 +147,19 @@ export default function WebLLMChat() {
 
     const augmentedUserMessage: Message = {
       role: "user",
-      content: `Use the provided context to answer the user's latest question.\n\nContext:\n${memoryContext}\n\nQuestion: ${userText}`
+      content: `Use the provided context to answer the user's latest question.\n\nContext:\n${memoryContext}\n\nQuestion: ${userText}`,
     };
 
     const systemMessage: Message = {
       role: "system",
-      content: "You are an advanced, helpful AI assistant with memory. Prioritize [Known Facts about User] when formulating personal responses. Provide concise, direct answers."
+      content:
+        "You are an advanced, helpful AI assistant with memory. Prioritize [Known Facts about User] when formulating personal responses. Provide concise, direct answers.",
     };
 
     const payloadMessages = [
       systemMessage,
       ...windowMessages.slice(0, -1),
-      augmentedUserMessage
+      augmentedUserMessage,
     ];
 
     // generate response
@@ -148,10 +175,7 @@ export default function WebLLMChat() {
         assistantText += chunk.choices?.[0]?.delta?.content || "";
         setMessages((prev) => {
           const copy = [...prev];
-          copy[copy.length - 1] = {
-            role: "assistant",
-            content: assistantText,
-          };
+          copy[copy.length - 1] = { role: "assistant", content: assistantText };
           return copy;
         });
       }
@@ -164,20 +188,23 @@ export default function WebLLMChat() {
 
   return (
     <div className="min-h-screen flex flex-col bg-gray-950 text-white">
-      {/* Header */}
       <div className="p-4 border-b border-gray-800 flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold">WebLLM Starter (RAG)</h1>
-          <p className="text-xs text-gray-400">Runs fully in browser (WebGPU)</p>
+          <p className="text-xs text-gray-400">
+            Runs fully in browser (WebGPU)
+          </p>
         </div>
 
         <div className="flex gap-2 items-center">
-          <button 
-             onClick={handleAddKnowledge}
-             className="bg-green-700 hover:bg-green-600 px-3 py-1 mr-2 rounded text-sm transition-colors">
-             + Add Knowledge
+          <button
+            type="button"
+            onClick={handleAddKnowledge}
+            className="bg-green-700 hover:bg-green-600 px-3 py-1 mr-2 rounded text-sm transition-colors"
+          >
+            + Add Knowledge
           </button>
-          
+
           <select
             className="bg-gray-900 border border-gray-700 px-2 py-1 rounded"
             value={model}
@@ -195,21 +222,16 @@ export default function WebLLMChat() {
         </div>
       </div>
 
-      {/* Status */}
       <div className="px-4 py-2 text-xs text-gray-400 border-b border-gray-800 flex justify-between">
         <span>{status}</span>
-        {conversationSummary && <span className="text-blue-400">Memory Active</span>}
       </div>
 
-      {/* Chat */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.map((m, i) => (
           <div
-            key={i}
+            key={`${m.role}-${i}`}
             className={`max-w-2xl p-3 rounded-lg whitespace-pre-wrap ${
-              m.role === "user"
-                ? "bg-blue-600 ml-auto"
-                : "bg-gray-800 mr-auto"
+              m.role === "user" ? "bg-blue-600 ml-auto" : "bg-gray-800 mr-auto"
             }`}
           >
             {m.content}
@@ -217,7 +239,6 @@ export default function WebLLMChat() {
         ))}
       </div>
 
-      {/* Input */}
       <div className="p-4 border-t border-gray-800 flex gap-2">
         <input
           className="flex-1 bg-gray-900 border border-gray-700 px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -227,6 +248,7 @@ export default function WebLLMChat() {
           onKeyDown={(e) => e.key === "Enter" && sendMessage()}
         />
         <button
+          type="button"
           onClick={sendMessage}
           disabled={loading}
           className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded disabled:opacity-50 transition-colors"
