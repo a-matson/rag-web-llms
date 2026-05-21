@@ -1,0 +1,139 @@
+import { getEmbedding } from "./rag";
+import { openDB, IDBPDatabase } from "idb";
+import type { Message } from "../app/page";
+import { cosineSimilarity } from "../utils";
+
+export interface MemoryChunk {
+  id: string;
+  text: string;
+  embedding: number[];
+  timestamp: number;
+}
+
+// multi-tiered db
+export async function initMemoryDB(): Promise<IDBPDatabase> {
+  return await openDB("webllm-memory-db", 1, {
+    upgrade(db) {
+      if (!db.objectStoreNames.contains("episodic")) {
+        db.createObjectStore("episodic", { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains("semantic")) {
+        db.createObjectStore("semantic", { keyPath: "id" });
+      }
+    },
+  });
+}
+
+// episodic memory
+export async function archiveToEpisodicMemory(messages: Message[]) {
+  const db = await initMemoryDB();
+  
+  // group user-assistant pairs to maintain context
+  const textToArchive = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
+  const embedding = await getEmbedding(textToArchive);
+  
+  const memory: MemoryChunk = {
+    id: crypto.randomUUID(),
+    text: textToArchive,
+    embedding,
+    timestamp: Date.now(),
+  };
+
+  await db.put("episodic", memory);
+}
+
+// semantic memory
+export async function extractAndStoreFacts(engine: any, userMessage: string) {
+  const db = await initMemoryDB();
+  
+  // use LLM to extract facts in a structured format
+  const prompt = `
+    Analyze the following user message and extract any concrete facts, personal preferences, or entities mentioned about the user. 
+    Format the output strictly as a JSON object with a single key "facts" containing an array of strings. 
+    If there are no facts to extract, return {"facts": []}.
+    
+    User Message: "${userMessage}"
+  `;
+
+  // exact schema for the LLM to follow
+  const factSchema = {
+    type: "object",
+    properties: { facts: { type: "array", items: { type: "string" } } },
+    required: ["facts"],
+  };
+
+  try {
+    const response = await engine.chat.completions.create({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1, 
+      response_format: { 
+        type: "json_object", 
+        schema: JSON.stringify(factSchema) 
+      },
+    });
+
+    const resultStr = response.choices[0].message.content;
+    const parsed = JSON.parse(resultStr || '{"facts": []}');
+    
+    if (parsed.facts && Array.isArray(parsed.facts) && parsed.facts.length > 0) {
+      const existingSemanticMemories: MemoryChunk[] = await db.getAll("semantic");
+      
+      for (const fact of parsed.facts) {
+        const embedding = await getEmbedding(fact);
+        
+        // semantic deduplication check
+        let isDuplicate = false;
+        for (const existingMem of existingSemanticMemories) {
+          const similarity = cosineSimilarity(embedding, existingMem.embedding);
+          if (similarity > 0.85) {
+            console.log(`Skipping duplicate fact: "${fact}" (Matches existing: "${existingMem.text}" with score ${similarity.toFixed(2)})`);
+            isDuplicate = true;
+            break;
+          }
+        }
+        
+        if (!isDuplicate) {
+          const memory: MemoryChunk = {
+            id: crypto.randomUUID(),
+            text: fact,
+            embedding,
+            timestamp: Date.now(),
+          };
+          await db.put("semantic", memory);
+          console.log("Extracted and saved new fact:", fact);
+
+          existingSemanticMemories.push(memory);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Fact extraction failed:", e);
+  }
+}
+
+// query memory
+export async function retrieveRelevantMemory(queryEmbedding: number[], topK: number = 3) {
+  const db = await initMemoryDB();
+  
+  const episodic: MemoryChunk[] = await db.getAll("episodic");
+  const semantic: MemoryChunk[] = await db.getAll("semantic");
+
+  // score episodic memories (past conversations)
+  const episodicScores = episodic.map(chunk => ({
+    ...chunk,
+    type: "episodic",
+    score: cosineSimilarity(queryEmbedding, chunk.embedding),
+  })).sort((a, b) => b.score - a.score).slice(0, topK);
+
+  // score semantic memories (core facts)
+  const semanticScores = semantic.map(chunk => ({
+    ...chunk,
+    type: "semantic",
+    score: cosineSimilarity(queryEmbedding, chunk.embedding),
+  })).sort((a, b) => b.score - a.score).slice(0, topK);
+
+  return {
+    episodic: episodicScores.filter(s => s.score > 0.5),
+    semantic: semanticScores.filter(s => s.score > 0.55),
+  };
+}

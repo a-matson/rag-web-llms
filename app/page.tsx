@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import * as webllm from "@mlc-ai/web-llm";
 import { addDocument, generateHyDE, getEmbedding, searchDocumentsHybrid } from "../lib/rag";
 import { getSlidingWindow, summarizeOldMessages, MAX_CONTEXT_TOKENS } from "../lib/budget";
+import { archiveToEpisodicMemory, extractAndStoreFacts, retrieveRelevantMemory } from "../lib/memory";
 
 export type Message = { role: "user" | "assistant" | "system"; content: string };
 
@@ -72,6 +73,12 @@ export default function WebLLMChat() {
     const userText = prompt;
     setPrompt("");
 
+    const displayMessage: Message = { role: "user", content: userText };
+    const newMessages = [...messages, displayMessage];
+    setMessages([...newMessages, { role: "assistant", content: "" }]);
+
+    extractAndStoreFacts(engineRef.current, userText);
+
     // HyDE query transformation
     setStatus("Thinking about the query (HyDE)...");
     let searchEmbedding: number[];
@@ -83,39 +90,48 @@ export default function WebLLMChat() {
       searchEmbedding = await getEmbedding(userText);
     }
 
-    // hybrid retrieval (RAG)
-    setStatus("Searching knowledge base (Hybrid Search)...");
-    const retrievedDocs = await searchDocumentsHybrid(userText, searchEmbedding, 4);
+   // hybrid retrieval across RAG + episodic + semantic
+    setStatus("Searching knowledge base (Hybrid Search) and Memories...");
+    const [retrievedDocs, relevantMemories] = await Promise.all([
+      searchDocumentsHybrid(userText, searchEmbedding, 3), 
+      retrieveRelevantMemory(searchEmbedding, 3)           
+    ]);
     
-    // Token budgeting = MAX_CONTEXT_TOKENS - RAG - system - summary
-    const historyBudget = MAX_CONTEXT_TOKENS - 1000 - 200 - 500;
-    const windowMessages = getSlidingWindow(messages, historyBudget);
+    // token budgeting
+    const historyBudget = MAX_CONTEXT_TOKENS - 1500; 
+    const windowMessages = getSlidingWindow(newMessages, historyBudget);
 
-    const contextStr = retrievedDocs.map((d, idx) => `[Source Chunk ${idx + 1}]:\n${d.text}`).join("\n\n");
-    
-    const overflowMessages = messages.slice(0, messages.length - windowMessages.length);
+    // archive overflowing messages to episodic memory
+    const overflowMessages = newMessages.slice(0, newMessages.length - windowMessages.length);
     if (overflowMessages.length > 0) {
-      summarizeOldMessages(engineRef.current, overflowMessages, conversationSummary)
-        .then(newSummary => setConversationSummary(newSummary))
-        .catch(console.error);
+      await archiveToEpisodicMemory(overflowMessages);
     }
 
-    const displayMessage: Message = { role: "user", content: userText };
-    setMessages([...messages, displayMessage, { role: "assistant", content: "" }]);
+    // build the contextualised prompt
+    const memoryContext = `
+    [Known Facts about User]:
+    ${relevantMemories.semantic.length ? relevantMemories.semantic.map(f => `- ${f.text}`).join("\n") : "None relevant."}
+
+    [Past Conversation Context]:
+    ${relevantMemories.episodic.length ? relevantMemories.episodic.map(e => `...\n${e.text}\n...`).join("\n") : "None relevant."}
+
+    [Knowledge Base / RAG]:
+    ${retrievedDocs.length ? retrievedDocs.map((d, i) => `Chunk ${i + 1}:\n${d.text}`).join("\n\n") : "None relevant."}
+    `;
 
     const augmentedUserMessage: Message = {
       role: "user",
-      content: `Use the provided context to answer the question. \n\nContext:\n${contextStr}\n\nQuestion: ${userText}`
+      content: `Use the provided context to answer the user's latest question.\n\nContext:\n${memoryContext}\n\nQuestion: ${userText}`
     };
 
     const systemMessage: Message = {
       role: "system",
-      content: `You are a helpful AI. \nPrevious conversation summary: ${conversationSummary}`
+      content: "You are an advanced, helpful AI assistant with memory. Prioritize [Known Facts about User] when formulating personal responses. Provide concise, direct answers."
     };
 
     const payloadMessages = [
       systemMessage,
-      ...windowMessages,
+      ...windowMessages.slice(0, -1),
       augmentedUserMessage
     ];
 

@@ -1,6 +1,7 @@
 import { pipeline, FeatureExtractionPipeline } from "@huggingface/transformers";
 import { openDB, IDBPDatabase } from "idb";
 import MiniSearch from "minisearch";
+import { cosineSimilarity } from "../utils";
 
 // embeddings
 let embedder: FeatureExtractionPipeline | null = null;
@@ -99,17 +100,6 @@ export async function addDocument(text: string) {
       miniSearch.add(docChunk);
     }
   }
-}
-
-// hybrid retrival & HyDE
-function cosineSimilarity(a: number[], b: number[]) {
-  let dotProduct = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 // HyDE: generate a hypothetical answer to improve embedding matching
