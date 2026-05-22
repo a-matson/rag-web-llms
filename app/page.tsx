@@ -29,6 +29,10 @@ const MODELS = [
     label: "Gemma 2B (balanced)",
     value: "gemma-2-2b-it-q4f16_1-MLC",
   },
+  {
+    label: "SmolLM2 1.7B (small)",
+    value: "SmolLM2-1.7B-Instruct-q4f16_1-MLC",
+  }
 ];
 
 export default function WebLLMChat() {
